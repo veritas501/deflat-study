@@ -164,6 +164,7 @@ class DeFlat:
         self.next_state = None
         # 配置选项
         self.use_unicorn = False
+        self.exclude_relevant = []
 
     def run(self):
         """
@@ -184,77 +185,6 @@ class DeFlat:
         self.__new_do_patch()
         # self.__do_patch()
         print(f'\n\n########################## done #########################')
-
-    def __new_do_patch(self):
-        sym_tbl = set()
-        rebuild_asm = '.intel_syntax noprefix\n.section .text\n.global _start\n'
-        rebuild_asm += '.type _start, @function\n_start:\n\n'
-        rebuild_flows = self.flows.copy()
-        ret_flow = RecoverInfo(self.ret_node)
-        ret_flow.successors = None
-        rebuild_flows.append(ret_flow)
-        for f in rebuild_flows:
-            print(PrettyPrint.info(f'rebuilding block: {hex(f.node.addr)}'))
-            block = self.p.factory.block(f.node.addr, size=f.node.size)
-            block_asm = f'block_{hex(f.node.addr)}:\n'
-            for ins in block.capstone.insns:
-                if 'rip' in ins.op_str:
-                    rip_arg = re.search(r'(?P<rip_arg>rip [+-] 0x[0-9a-fA-F]+)', ins.op_str).group('rip_arg')
-                    offset = int(rip_arg.replace(' ', '')[3:], 16)
-                    addr = ins.address + ins.size
-                    target_addr = addr + offset
-                    sym_tbl.add(target_addr)
-                    block_asm += f'{ins.mnemonic} {ins.op_str.replace(rip_arg, f"rip+sym_{hex(target_addr)}")}\n'
-                elif 'call' in ins.mnemonic:
-                    addr = int(ins.op_str, 16)
-                    sym_tbl.add(addr)
-                    block_asm += f'{ins.mnemonic} sym_{hex(addr)}\n'
-                elif ins.mnemonic.startswith('j') or ins.mnemonic.startswith('cmov'):
-                    break
-                else:
-                    block_asm += f'{ins.mnemonic} {ins.op_str}\n'
-            if f.successors:
-                if not f.is_cond:
-                    block_asm += f'jmp block_{hex(f.successors[0].addr)}\n\n'
-                else:
-                    block_asm += f'j{f.cond_op} block_{hex(f.successors[0].addr)}\n'
-                    block_asm += f'jmp block_{hex(f.successors[1].addr)}\n\n'
-            else:
-                block_asm += '\n'
-            rebuild_asm += block_asm
-        rebuild_asm += '.size _start, .-_start\n'
-        for sym_addr in sym_tbl:
-            rebuild_asm += f'.section .sec_{hex(sym_addr)}\nsym_{hex(sym_addr)}:\n\n'
-        rebuildfile_asm = NamedTemporaryFile(mode='w')
-        rebuildfile_asm.write(rebuild_asm)
-        rebuildfile_asm.flush()
-        rebuildfile_obj = NamedTemporaryFile()
-        rebuildfile_elf = NamedTemporaryFile()
-        as_cmd = f'as -64 -o {rebuildfile_obj.name} {rebuildfile_asm.name}'
-        os.system(as_cmd)
-        ld_cmd = f'ld {rebuildfile_obj.name} -o {rebuildfile_elf.name} --section-start=.text={hex(self.function_addr)}'
-        for sym_addr in sym_tbl:
-            ld_cmd += f' --section-start=.sec_{hex(sym_addr)}={hex(sym_addr)}'
-        os.system(ld_cmd)
-        new_p = angr.Project(rebuildfile_elf.name, load_options={'auto_load_libs': False})
-        new_whole_cfg = new_p.analyses.CFG()
-        new_func = new_whole_cfg.functions[self.function_addr]
-        new_func.normalize()
-        offset = new_p.loader.main_object.addr_to_offset(self.function_addr)
-        rebuildfile_elf.seek(offset)
-        patch_data = rebuildfile_elf.read(new_func.size)
-        binary_name = self.p.loader.main_object.binary_basename
-        deflat_binary_name = f'newdeflat_{binary_name}'
-        raw_binary_data = bytearray(open(self.p.loader.main_object.binary, 'rb').read())
-        patch_start = self.p.loader.main_object.addr_to_offset(self.func.addr)
-        patch_size = self.func.size
-        raw_binary_data[patch_start:patch_start + patch_size] = ASM.x86_nop(patch_size)
-        raw_binary_data[patch_start:patch_start + new_func.size] = patch_data
-        open(deflat_binary_name, 'wb').write(raw_binary_data)
-        print(PrettyPrint.success(f'write deflat binary to {PrettyPrint.underline(deflat_binary_name)}'))
-        rebuildfile_asm.close()
-        rebuildfile_obj.close()
-        rebuildfile_elf.close()
 
     def __init_node(self):
         # 初始化nodes_info
@@ -297,6 +227,10 @@ class DeFlat:
             self.__get_x86_relevant_nodes()
         else:
             self.__print_arch_not_support_and_exit()
+        if self.exclude_relevant:
+            self.relevant_nodes = list(filter(
+                lambda n: n.addr not in self.exclude_relevant,
+                self.relevant_nodes))
         print(PrettyPrint.success(f'relevant_nodes: {list(map(lambda x: hex(x.addr), self.relevant_nodes))}'))
         self.nop_nodes = list(self.cfg.nodes)
         self.nop_nodes.remove(self.prologue_node)
@@ -483,6 +417,75 @@ class DeFlat:
         sm = self.p.factory.simgr(st)
         sm.run(until=lambda _self: self.terminate_block)
 
+    def __new_do_patch(self):
+        sym_tbl = set()
+        rebuild_asm = '.intel_syntax noprefix\n.section .text\n.global _start\n'
+        rebuild_asm += '.type _start, @function\n_start:\n\n'
+        rebuild_flows = self.flows.copy()
+        ret_flow = RecoverInfo(self.ret_node)
+        ret_flow.successors = None
+        rebuild_flows.append(ret_flow)
+        for f in rebuild_flows:
+            print(PrettyPrint.info(f'rebuilding block: {hex(f.node.addr)}'))
+            block = self.p.factory.block(f.node.addr, size=f.node.size)
+            block_asm = f'block_{hex(f.node.addr)}:\n'
+            for ins in block.capstone.insns:
+                if 'rip' in ins.op_str:
+                    rip_arg = re.search(r'(?P<rip_arg>rip [+-] 0x[0-9a-fA-F]+)', ins.op_str).group('rip_arg')
+                    offset = int(rip_arg.replace(' ', '')[3:], 16)
+                    addr = ins.address + ins.size
+                    target_addr = addr + offset
+                    sym_tbl.add(target_addr)
+                    block_asm += f'{ins.mnemonic} {ins.op_str.replace(rip_arg, f"rip+sym_{hex(target_addr)}")}\n'
+                elif 'call' in ins.mnemonic:
+                    addr = int(ins.op_str, 16)
+                    sym_tbl.add(addr)
+                    block_asm += f'{ins.mnemonic} sym_{hex(addr)}\n'
+                elif ins.mnemonic.startswith('j') or ins.mnemonic.startswith('cmov'):
+                    break
+                else:
+                    block_asm += f'{ins.mnemonic} {ins.op_str}\n'
+            if f.successors:
+                if not f.is_cond:
+                    block_asm += f'jmp block_{hex(f.successors[0].addr)}\n\n'
+                else:
+                    block_asm += f'j{f.cond_op} block_{hex(f.successors[0].addr)}\n'
+                    block_asm += f'jmp block_{hex(f.successors[1].addr)}\n\n'
+            else:
+                block_asm += '\n'
+            rebuild_asm += block_asm
+        rebuild_asm += '.size _start, .-_start\n'
+        for sym_addr in sym_tbl:
+            rebuild_asm += f'.section .sec_{hex(sym_addr)}\nsym_{hex(sym_addr)}:\n\n'
+        # print(rebuild_asm)
+        rebuildfile_asm = NamedTemporaryFile(mode='w', delete=False)
+        rebuildfile_asm.write(rebuild_asm)
+        rebuildfile_asm.flush()
+        rebuildfile_obj = NamedTemporaryFile()
+        rebuildfile_elf = NamedTemporaryFile(delete=False)
+        as_cmd = f'x86_64-linux-gnu-as -64 -o {rebuildfile_obj.name} {rebuildfile_asm.name}'
+        os.system(as_cmd)
+        ld_cmd = f'x86_64-linux-gnu-ld {rebuildfile_obj.name} -o {rebuildfile_elf.name} ' + \
+                 f'--section-start=.text={hex(self.function_addr)}'
+        for sym_addr in sym_tbl:
+            ld_cmd += f' --section-start=.sec_{hex(sym_addr)}={hex(sym_addr)}'
+        os.system(ld_cmd)
+        new_p = angr.Project(rebuildfile_elf.name, load_options={'auto_load_libs': False})
+        patch_size = new_p.loader.main_object.get_symbol('_start').size
+        print(patch_size)
+        rebuildfile_elf.seek(new_p.loader.main_object.addr_to_offset(self.function_addr))
+        patch_data = rebuildfile_elf.read(patch_size)
+        binary_name = self.p.loader.main_object.binary_basename
+        deflat_binary_name = f'newdeflat_{binary_name}'
+        raw_binary_data = bytearray(open(self.p.loader.main_object.binary, 'rb').read())
+        patch_start = self.p.loader.main_object.addr_to_offset(self.func.addr)
+        raw_binary_data[patch_start:patch_start + patch_size] = patch_data
+        open(deflat_binary_name, 'wb').write(raw_binary_data)
+        print(PrettyPrint.success(f'write deflat binary to {PrettyPrint.underline(deflat_binary_name)}'))
+        rebuildfile_asm.close()
+        rebuildfile_obj.close()
+        rebuildfile_elf.close()
+
     def __do_patch(self):
         def vma_to_file_offset(vma):
             return self.p.loader.main_object.addr_to_offset(vma)
@@ -539,11 +542,15 @@ class DeFlat:
                 if not indegree.get(s.addr):
                     indegree[s.addr] = 0
                 indegree[s.addr] += 1
-        print(PrettyPrint.info(f'nodes in_degree: {str({hex(addr): indegree[addr] for addr in indegree})}'))
+        print(PrettyPrint.info(f'nodes in_degree:'))
+        indegree_tuple_list = sorted(indegree.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+        print({hex(a): b for a, b in indegree_tuple_list})
         count_of_zero_indegree = list(indegree.values()).count(0)
         if count_of_zero_indegree > 1:
             print(PrettyPrint.warn(
-                f'find {count_of_zero_indegree} nodes\' indegree == 0, result should be wrong, continue? [y/N]'))
+                f'find {count_of_zero_indegree} nodes\' indegree == 0, result should be wrong'))
+            print(PrettyPrint.warn(
+                f'maybe you should check node {hex(indegree_tuple_list[0][0])} manually, continue? [y/N]'))
             choice = input()
             if 'y' not in choice.lower():
                 exit(0)
@@ -559,6 +566,7 @@ if __name__ == "__main__":
     parser.add_argument("--addr", help="address of target function in hex format")
     parser.add_argument("--unicorn", action='store_true', default=False,
                         help="use unicorn (faster but may recover wrong flow)")
+    parser.add_argument("--exclude", nargs='+', help="exclude nodes from relevant nodes")
     args = parser.parse_args()
 
     if args.file is None or args.addr is None:
@@ -569,6 +577,9 @@ if __name__ == "__main__":
     deflat = DeFlat(args.file, int(args.addr, 16))
     if args.unicorn:
         deflat.use_unicorn = True
+    if args.exclude:
+        exclude_addr = list(map(lambda x: int(x, 16), args.exclude))
+        deflat.exclude_relevant = exclude_addr
     deflat.run()
     t2 = time.perf_counter_ns() / 1000 / 1000 / 1000
     print(PrettyPrint.info(f'time cost: {t2 - t1}'))
