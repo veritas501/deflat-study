@@ -554,6 +554,13 @@ class DeFlat:
             choice = input()
             if 'y' not in choice.lower():
                 exit(0)
+            # else:
+            #     # 将入度为0的节点（除序言块外）从flow中剔除
+            #     self.flows = list(filter(
+            #         lambda r: indegree[r.node.addr] != 0 or r.node == self.prologue_node,
+            #         self.flows
+            #     ))
+            #     self.__pretty_print_flows()
 
     def __print_arch_not_support_and_exit(self):
         print(PrettyPrint.fail(f'Arch {self.p.arch.name} is not supported yet'))
